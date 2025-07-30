@@ -1,0 +1,513 @@
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const { ensureJsonFileExists } = require('./fileUtils');
+
+const userDataPath = path.join(__dirname, '../data/userData.json');
+let userData = ensureJsonFileExists(userDataPath, {});
+
+const saveUserData = () => {
+    try {
+        fs.writeFileSync(userDataPath, JSON.stringify(userData, null, 2));
+        console.log('💾 User data saved successfully');
+    } catch (error) {
+        console.error('❌ Error saving user data:', error);
+    }
+};
+
+const getUserData = (userId, member = null) => {
+    if (!userData[userId]) {
+        userData[userId] = {
+            membership: 'Basic',
+            trackedSellers: [],
+            seenASINs: {}
+        };
+    }
+
+    // Handle data structure migration
+    if (userData[userId].sellers && !userData[userId].trackedSellers) {
+        userData[userId].trackedSellers = userData[userId].sellers;
+        delete userData[userId].sellers;
+        saveUserData();
+    }
+
+    if (member?.roles?.cache) {
+        const roleNames = member.roles.cache.map(role => role.name);
+        console.log(`👤 ${member.user.username} has roles:`, roleNames);
+
+        const roleTiers = ['Chiefs', 'Gold', 'Silver'];
+        const matched = roleTiers.find(tier => roleNames.includes(tier));
+        userData[userId].membership = matched ?? 'Basic';
+    } else {
+        console.log('⚠️ No member.roles.cache found');
+    }
+
+    return userData[userId];
+};
+
+// Helper function to get seller name
+const getSellerName = async (sellerId) => {
+    try {
+        const sellerRes = await axios.get('https://api.keepa.com/seller', {
+            params: {
+                key: process.env.KEEPA_API_KEY,
+                domain: 3, // UK Amazon
+                seller: sellerId
+            },
+            timeout: 10000
+        });
+        
+        if (sellerRes.data && !sellerRes.data.error && sellerRes.data.sellerName) {
+            console.log(`🏪 Found seller name: ${sellerRes.data.sellerName}`);
+            return sellerRes.data.sellerName;
+        }
+        return null;
+    } catch (err) {
+        console.error(`❌ Error getting seller name:`, err.message);
+        return null;
+    }
+};
+
+// Import the Amazon scraper
+const amazonScraper = require('./amazon_bridge');
+
+const fetchSellerInventory = async (sellerId, forceRefresh = false) => {
+    try {
+        console.log(`🔍 Getting inventory for seller ${sellerId}`);
+        
+        let foundProducts = [];
+        
+        // First attempt: Try to use Keepa API if available
+        if (process.env.KEEPA_API_KEY) {
+            console.log(`📡 Attempting to use Keepa API first for seller ${sellerId}...`);
+            try {
+                // Get seller data from Keepa
+                const sellerRes = await axios.get('https://api.keepa.com/seller', {
+                    params: {
+                        key: process.env.KEEPA_API_KEY,
+                        domain: 3, // UK Amazon
+                        seller: sellerId
+                    },
+                    timeout: 10000
+                });
+                
+                if (sellerRes.data && !sellerRes.data.error) {
+                    console.log(`✅ Found seller data from Keepa for ${sellerId}`);
+                    
+                    // Let's try to get products from this seller using Keepa's best seller API
+                    // This gives bestselling products for a seller and may be more reliable
+                    console.log(`🔍 Using Keepa best seller API for seller ${sellerId}`);
+                    
+                    try {
+                        // Approach 1: Try to get the best seller products for the seller
+                        const bestsellerRes = await axios.get('https://api.keepa.com/bestsellers', {
+                            params: {
+                                key: process.env.KEEPA_API_KEY,
+                                domain: 3, // UK Amazon
+                                rangeName: `SALES_seller_${sellerId}`, // Format for seller bestsellers
+                                update: forceRefresh ? 1 : 0
+                            },
+                            timeout: 25000 // Extended timeout
+                        });
+                        
+                        if (bestsellerRes.data && 
+                            bestsellerRes.data.asinList && 
+                            bestsellerRes.data.asinList.length > 0) {
+                            
+                            console.log(`✅ Found ${bestsellerRes.data.asinList.length} products from Keepa bestseller API!`);
+                            
+                            // Process the ASINs in batches to avoid API limits
+                            const asins = bestsellerRes.data.asinList;
+                            const batchSize = 20; // Keepa recommends no more than 20-25 ASINs per request
+                            let processedProducts = [];
+                            
+                            // Process in batches
+                            for (let i = 0; i < asins.length; i += batchSize) {
+                                const batch = asins.slice(i, i + batchSize);
+                                console.log(`📦 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(asins.length/batchSize)} (${batch.length} products)`);
+                                
+                                const batchResult = await axios.get('https://api.keepa.com/product', {
+                                    params: {
+                                        key: process.env.KEEPA_API_KEY,
+                                        domain: 3, // UK Amazon
+                                        asin: batch.join(',')
+                                    },
+                                    timeout: 25000
+                                });
+                                
+                                if (batchResult.data && batchResult.data.products) {
+                                    batchResult.data.products.forEach(product => {
+                                        if (product && product.title) {
+                                            // Format the product for our system
+                                            processedProducts.push({
+                                                asin: product.asin,
+                                                title: product.title,
+                                                link: `https://www.amazon.co.uk/dp/${product.asin}`,
+                                                marketplace: 'UK',
+                                                seller_id: sellerId,
+                                                seller_name: sellerRes.data.sellerName || 'Unknown',
+                                                source: 'keepa_bestseller'
+                                            });
+                                        }
+                                    });
+                                }
+                                
+                                // Add a small delay between batch requests
+                                if (i + batchSize < asins.length) {
+                                    await new Promise(resolve => setTimeout(resolve, 1000));
+                                }
+                            }
+                            
+                            console.log(`✅ Successfully processed ${processedProducts.length} products from Keepa API`);
+                            return processedProducts;
+                        }
+                    } catch (bestsellerErr) {
+                        console.log(`⚠️ Bestseller API failed: ${bestsellerErr.message}`);
+                    }
+                    
+                    // If bestseller didn't work, try plain product search
+                    try {
+                        console.log(`🔍 Trying Keepa direct product finder...`);
+                        const productSearchRes = await axios.get('https://api.keepa.com/search', {
+                            params: {
+                                key: process.env.KEEPA_API_KEY,
+                                domain: 3, // UK Amazon
+                                type: 'product',
+                                term: `seller:${sellerId}`, // Special format for seller searches
+                            },
+                            timeout: 25000
+                        });
+                    
+                    // Check if we got results from the product search
+                    if (productSearchRes.data && productSearchRes.data.asinList && productSearchRes.data.asinList.length > 0) {
+                        console.log(`✅ Found ${productSearchRes.data.asinList.length} products from Keepa product search API!`);
+                        console.log(`🔍 Getting details for first batch of products...`);
+                        
+                        // Get details for a batch of products (API limits apply)
+                        const asinsToProcess = productSearchRes.data.asinList.slice(0, 50);
+                        
+                        const productRes = await axios.get('https://api.keepa.com/product', {
+                            params: {
+                                key: process.env.KEEPA_API_KEY,
+                                domain: 3, // UK Amazon
+                                asin: asinsToProcess.join(',')
+                            },
+                            timeout: 20000
+                        });
+                        
+                        if (productRes.data && productRes.data.products) {
+                            // Process Keepa products
+                            productRes.data.products.forEach(product => {
+                                if (product && product.title) {
+                                    // Add seller info
+                                    product.seller = {
+                                        id: sellerId,
+                                        name: sellerRes.data.sellerName || 'Unknown'
+                                    };
+                                    
+                                    product.marketplace = 'UK';
+                                    product.source = 'keepa'; // Mark the source
+                                    
+                                    foundProducts.push(product);
+                                }
+                            });
+                            
+                            if (foundProducts.length > 0) {
+                                console.log(`✅ Successfully found ${foundProducts.length} products from Keepa API`);
+                                return foundProducts;
+                            }
+                        }
+                    } else {
+                        console.log(`ℹ️ Keepa API doesn't provide product list with current tier. Response data:`, JSON.stringify(sellerRes.data).substring(0, 500));
+                        
+                        // Let's check if stats are available and log them
+                        if (sellerRes.data && sellerRes.data.stats) {
+                            console.log(`📊 Seller stats from Keepa: ${JSON.stringify(sellerRes.data.stats)}`);
+                        }
+                        
+                        // Check if there's a bsr/ASIN or listingCount property
+                        if (sellerRes.data && sellerRes.data.bsrList) {
+                            console.log(`📋 BSR List length: ${sellerRes.data.bsrList ? sellerRes.data.bsrList.length : 0}`);
+                        }
+                        
+                        if (sellerRes.data && sellerRes.data.totalInventory) {
+                            console.log(`📦 Total inventory reported by Keepa: ${sellerRes.data.totalInventory}`);
+                        }
+                        
+                        // After Keepa API fails, let's try using their Browse API which might have different limitations
+                        console.log(`🔍 Attempting to use Keepa Browse API for seller ${sellerId}...`);
+                        try {
+                            // Try the browse endpoint which might give us ASINs directly
+                            // Try product finder with a different approach
+                            const browseRes = await axios.get('https://api.keepa.com/product', {
+                                params: {
+                                    key: process.env.KEEPA_API_KEY,
+                                    domain: 3, // UK Amazon
+                                    seller: sellerId,
+                                    perPage: 100,
+                                    page: 0,
+                                    offers: 5, // Include seller's offers in the response
+                                    stats: 90 // Include 90-day statistics 
+                                },
+                                timeout: 20000
+                            });
+                            
+                            if (browseRes.data && browseRes.data.products && browseRes.data.products.length > 0) {
+                                console.log(`✅ Success! Found ${browseRes.data.products.length} products from Keepa direct product API!`);
+                                
+                                // Since we already have the products, no need for another API call
+                                const products = browseRes.data.products;
+                                if (products && products.length > 0) {
+                                    // Process Keepa products
+                                    products.forEach(product => {
+                                        if (product && product.title) {
+                                            // Add seller info
+                                            product.seller = {
+                                                id: sellerId,
+                                                name: sellerRes.data.sellerName || 'Unknown'
+                                            };
+                                            
+                                            product.marketplace = 'UK';
+                                            product.source = 'keepa_browse'; // Mark the source
+                                            
+                                            foundProducts.push(product);
+                                        }
+                                    });
+                                    
+                                    if (foundProducts.length > 0) {
+                                        console.log(`✅ Successfully found ${foundProducts.length} products from Keepa Browse API`);
+                                        return foundProducts;
+                                    }
+                                }
+                            } else {
+                                console.log(`ℹ️ Keepa Browse API didn't return any products for this seller`);
+                            }
+                        } catch (browseErr) {
+                            console.log(`ℹ️ Keepa Browse API approach failed: ${browseErr.message}`);
+                        }
+                    }
+                } else {
+                    console.log(`ℹ️ No valid seller data from Keepa API`);
+                }
+            } catch (err) {
+                console.log(`ℹ️ Keepa API approach failed: ${err.message}`);
+            }
+        } else {
+            console.log(`ℹ️ No Keepa API key available, skipping Keepa approach`);
+        }
+        
+        // Second approach: Use Amazon scraper since Keepa didn't work
+        console.log(`🛒 Falling back to direct Amazon scraping for seller ${sellerId}...`);
+        
+        try {
+            // Call our Amazon scraper to get products directly from Amazon
+            const amazonProducts = await amazonScraper.getSellerProducts(sellerId, 'co.uk', forceRefresh);
+            
+            if (amazonProducts && amazonProducts.length > 0) {
+                console.log(`✅ Found ${amazonProducts.length} products from Amazon scraper!`);
+                
+                // Add these products to our results - they're already formatted by the amazon_bridge.js
+                foundProducts = amazonProducts;
+                
+                return foundProducts;
+            } else {
+                console.log(`⚠️ Amazon scraper found no products for ${sellerId}`);
+            }
+        } catch (err) {
+            console.error(`❌ Error with Amazon scraper: ${err.message}`);
+        }
+        
+        // If we still have no products, log the issue
+        if (foundProducts.length === 0) {
+            console.log(`⚠️ Could not find any products for seller ${sellerId} after multiple attempts`);
+            return [];
+        }
+        
+        console.log(`📦 Total products found: ${foundProducts.length}`);
+        
+        // Log sample product info if available
+        if (foundProducts.length > 0) {
+            const sampleProduct = foundProducts[0];
+            console.log(`📌 Sample product - ASIN: ${sampleProduct.asin}, Title: ${sampleProduct.title || 'No title'}`);
+        }
+        
+        return foundProducts;
+    } catch (err) {
+        console.error(`❌ Error in fetchSellerInventory:`, err.message);
+        return [];
+    }
+};
+
+const checkAllUsers = async (client, forceRefresh = false) => {
+    console.log(`🔄 Starting Keepa check for all users... ${forceRefresh ? '(FORCE REFRESH ENABLED)' : ''}`);
+    
+    // Get information about the initiating user (if this is a forced check)
+    let initiatingUser = null;
+    let initiatingUserId = null;
+    let specificUserOnly = false;
+    
+    // Track results for reporting back to command
+    global.forceCheckResults = {
+        newProductsFound: 0
+    };
+    
+    if (global.forceCheckInitiator) {
+        initiatingUserId = global.forceCheckInitiator.userId;
+        console.log(`🔍 Force check initiated by user ID: ${initiatingUserId}`);
+        specificUserOnly = true;
+        
+        // If forceRefresh wasn't passed as a parameter, check if it's set in the initiator
+        if (!forceRefresh && global.forceCheckInitiator.forceRefresh) {
+            forceRefresh = true;
+            console.log(`🔄 Force refresh enabled from initiator`);
+        }
+        
+        try {
+            initiatingUser = await client.users.fetch(initiatingUserId);
+            console.log(`✅ Successfully fetched initiating user: ${initiatingUser.tag}`);
+        } catch (err) {
+            console.error(`❌ Failed to fetch initiating user: ${err.message}`);
+        }
+    }
+    
+    // Get list of user IDs to process - either from userData or active Discord users
+    const userIds = Object.keys(userData);
+    
+    if (userIds.length === 0) {
+        console.log('⚠️ No users in userData, nothing to check');
+        return;
+    }
+    
+    for (const userId of userIds) {
+        // If this is a forced check by a specific user, only check their data
+        if (specificUserOnly && userId !== initiatingUserId) {
+            console.log(`⏭️ Skipping user ${userId} (not the initiating user)`);
+            continue;
+        }
+        
+        try {
+            // Try to fetch the user from Discord
+            const user = await client.users.fetch(userId).catch((err) => {
+                console.log(`⚠️ Error fetching user ${userId}: ${err.message}`);
+                return null;
+            });
+            
+            // Skip users we can't fetch
+            if (!user) {
+                console.log(`⚠️ Couldn't fetch user ${userId}, skipping...`);
+                continue;
+            }
+            
+            const data = getUserData(userId);
+            console.log(`📋 Checking ${data.trackedSellers?.length || 0} sellers for user ${user.tag}`);
+
+            if (!Array.isArray(data.trackedSellers) || data.trackedSellers.length === 0) {
+                console.log(`ℹ️ User ${user.tag} has no tracked sellers`);
+                continue;
+            }
+
+            // Ensure seenASINs structure exists
+            if (!data.seenASINs) {
+                data.seenASINs = {};
+                saveUserData();
+            }
+
+            for (const sellerId of data.trackedSellers) {
+                if (!sellerId || typeof sellerId !== 'string') {
+                    console.warn(`⚠️ Invalid seller ID for user ${userId}: ${sellerId}`);
+                    continue;
+                }
+                
+                // Normalize the seller ID (trim whitespace, ensure consistent format)
+                const normalizedSellerId = sellerId.trim();
+                
+                console.log(`🔍 Checking seller ${normalizedSellerId} for user ${userId}`);
+                console.log(`Force refresh: ${forceRefresh ? 'Yes' : 'No'}`);
+                const products = await fetchSellerInventory(normalizedSellerId, forceRefresh);
+                
+                // Ensure the seenASINs structure is correct using the normalized ID
+                if (!data.seenASINs[normalizedSellerId]) {
+                    data.seenASINs[normalizedSellerId] = [];
+                }
+                
+                const newProducts = products.filter(p => 
+                    p && p.asin && !data.seenASINs[normalizedSellerId].includes(p.asin)
+                );
+
+                console.log(`🔎 Found ${newProducts.length} new products for seller ${normalizedSellerId}`);
+                
+                // Update the global counter for tracking new products in forcecheck
+                if (global.forceCheckResults) {
+                    global.forceCheckResults.newProductsFound += newProducts.length;
+                }
+
+                for (const product of newProducts) {
+                    // Get the seller's price specifically, if available
+                    let price = 'N/A';
+                    if (product.sellerInfo && product.sellerInfo.price) {
+                        price = `£${product.sellerInfo.price.toFixed(2)}`;
+                    } else if (product.buyBoxPrice) {
+                        price = `£${(product.buyBoxPrice / 100).toFixed(2)}`;
+                    }
+                    
+                    // Get the condition info if available
+                    let condition = '';
+                    if (product.sellerInfo && product.sellerInfo.condition) {
+                        const conditionMap = {
+                            0: 'New',
+                            1: 'Used - Like New',
+                            2: 'Used - Very Good',
+                            3: 'Used - Good',
+                            4: 'Used - Acceptable',
+                            5: 'Collectible - Like New',
+                            6: 'Collectible - Very Good',
+                            7: 'Collectible - Good',
+                            8: 'Collectible - Acceptable',
+                            9: 'Refurbished',
+                            10: 'Club'
+                        };
+                        condition = conditionMap[product.sellerInfo.condition] || 'Unknown';
+                        condition = `\nCondition: ${condition}`;
+                    }
+                    
+                    // Use the formatProductNotification helper from messageUtils
+                    const { formatProductNotification } = require('./messageUtils');
+                    const message = formatProductNotification(product, normalizedSellerId);
+
+                    try {
+                        await user.send(message);
+                        console.log(`✉️ DM sent to ${user.tag} about new product ${product.asin}`);
+                    } catch (err) {
+                        console.log(`⚠️ Could not DM ${user.tag}: ${err.message}`);
+                    }
+
+                    try {
+                        const logChannel = client.channels.cache.get(process.env.LOG_CHANNEL_ID);
+                        if (logChannel && logChannel.isTextBased()) {
+                            logChannel.send(`📤 **DM sent to <@${userId}>:**\n${message}`).catch(console.error);
+                        }
+                    } catch (err) {
+                        console.error(`❌ Could not log to channel: ${err.message}`);
+                    }
+
+                    data.seenASINs[normalizedSellerId].push(product.asin);
+                }
+
+                if (newProducts.length > 0) {
+                    saveUserData();
+                }
+            }
+        } catch (error) {
+            console.error(`❌ Error processing user ${userId}:`, error);
+        }
+    }
+    
+    console.log('✅ Keepa check completed for all users');
+};
+
+module.exports = {
+    getUserData,
+    saveUserData,
+    checkAllUsers,
+    fetchSellerInventory
+};
